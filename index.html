@@ -494,14 +494,25 @@
 
   // ─── State ────────────────────────────────────────────────────────────────
   let ws = null;
-  let audioCtx = null;
-  let analyser = null;
-  let mediaStream = null;
-  let mediaRecorder = null;
-  let animFrame = null;
   let isActive = false;
   let firstMessage = true;
+  let sessionUserId = null;
 
+  // Audio recording
+  let mediaStream = null;
+  let audioCtx = null;
+  let analyser = null;
+  let animFrame = null;
+  let scriptProcessor = null;
+  let micSource = null;
+
+  // Audio playback queue
+  let playbackCtx = null;
+  let playbackQueue = [];
+  let isPlaying = false;
+
+  // Sample rate for Linear16 (must match API)
+  const SAMPLE_RATE = 16000;
   const NUM_BARS = 32;
 
   // ─── Visualizer setup ─────────────────────────────────────────────────────
@@ -526,21 +537,17 @@
         opt.textContent = d.label || 'Microphone ' + sel.options.length;
         sel.appendChild(opt);
       });
-    } catch (e) {
-      // silently continue with default
-    }
+    } catch (e) {}
   }
   populateMics();
 
   // ─── UI helpers ───────────────────────────────────────────────────────────
   function setStatus(state, text) {
-    const dot = document.getElementById('statusDot');
-    const txt = document.getElementById('statusText');
-    dot.className = 'status-dot ' + state;
-    txt.textContent = text;
+    document.getElementById('statusDot').className = 'status-dot ' + state;
+    document.getElementById('statusText').textContent = text;
   }
 
-  function showToast(msg, dur = 3000) {
+  function showToast(msg, dur = 4000) {
     const t = document.getElementById('toast');
     t.textContent = msg;
     t.classList.add('show');
@@ -568,22 +575,16 @@
   function setButtonActive(active) {
     const btn = document.getElementById('startBtn');
     const lbl = document.getElementById('btnLabel');
-    if (active) {
-      btn.classList.add('active');
-      lbl.textContent = 'Stop';
-    } else {
-      btn.classList.remove('active');
-      lbl.textContent = 'Start';
-    }
+    btn.classList.toggle('active', active);
+    lbl.textContent = active ? 'Stop' : 'Start';
   }
 
-  // ─── Audio visualizer loop ────────────────────────────────────────────────
+  // ─── Visualizer ───────────────────────────────────────────────────────────
   function startVisualizer(stream) {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    analyser = audioCtx.createAnalyser();
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    analyser = ctx.createAnalyser();
     analyser.fftSize = 64;
-    const src = audioCtx.createMediaStreamSource(stream);
-    src.connect(analyser);
+    ctx.createMediaStreamSource(stream).connect(analyser);
     vizEl.classList.add('active');
     drawBars();
   }
@@ -593,9 +594,7 @@
     const data = new Uint8Array(analyser.frequencyBinCount);
     analyser.getByteFrequencyData(data);
     bars.forEach((b, i) => {
-      const v = (data[i] || 0) / 255;
-      const h = Math.max(4, v * 36);
-      b.style.height = h + 'px';
+      b.style.height = Math.max(4, (data[i] || 0) / 255 * 36) + 'px';
     });
   }
 
@@ -603,37 +602,139 @@
     if (animFrame) { cancelAnimationFrame(animFrame); animFrame = null; }
     bars.forEach(b => b.style.height = '4px');
     vizEl.classList.remove('active');
-    if (audioCtx) { audioCtx.close(); audioCtx = null; }
   }
 
-  // ─── WebSocket ────────────────────────────────────────────────────────────
-  function connectWS(endpoint, token) {
-    let url = endpoint.trim();
-    if (!url.startsWith('ws://') && !url.startsWith('wss://')) {
-      url = 'wss://' + url;
+  // ─── Audio helpers ────────────────────────────────────────────────────────
+  // Convert Float32 PCM → Linear16 → Base64
+  function float32ToBase64Linear16(float32Array) {
+    const int16 = new Int16Array(float32Array.length);
+    for (let i = 0; i < float32Array.length; i++) {
+      const s = Math.max(-1, Math.min(1, float32Array[i]));
+      int16[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
     }
+    const bytes = new Uint8Array(int16.buffer);
+    let binary = '';
+    for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
+  }
 
+  // Decode Base64 Linear16 → Float32 and play it
+  async function playAudioBase64(b64) {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    const int16 = new Int16Array(bytes.buffer);
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 32768;
+
+    if (!playbackCtx) playbackCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+
+    const buffer = playbackCtx.createBuffer(1, float32.length, SAMPLE_RATE);
+    buffer.copyToChannel(float32, 0);
+    playbackQueue.push(buffer);
+    if (!isPlaying) drainQueue();
+  }
+
+  function drainQueue() {
+    if (!playbackQueue.length) { isPlaying = false; return; }
+    isPlaying = true;
+    const buf = playbackQueue.shift();
+    const src = playbackCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(playbackCtx.destination);
+    src.onended = drainQueue;
+    src.start();
+  }
+
+  // ─── WebSocket v2 protocol ────────────────────────────────────────────────
+  function wsSend(obj) {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+  }
+
+  function connectWS(host, apiKey) {
+    // Build v2 endpoint URL
+    let url = host.trim();
+    if (!url.startsWith('ws://') && !url.startsWith('wss://')) url = 'wss://' + url;
+    // Remove trailing slash then append v2 path
+    url = url.replace(/\/$/, '') + '/api/voice/v2/user-stt-bot-tts/stream';
+
+    sessionUserId = 'user_' + Math.random().toString(36).slice(2, 10);
     setStatus('connecting', 'Connecting…');
-    ws = new WebSocket(url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(token));
+
+    ws = new WebSocket(url);
 
     ws.onopen = () => {
-      setStatus('connected', 'Connected');
-      addMessage('system', '✓ Connected to ' + endpoint);
+      addMessage('system', '✓ WebSocket connected');
+
+      // Step 1: send open frame with api_key
+      wsSend({ kind: 'open', api_key: apiKey });
     };
 
     ws.onmessage = (ev) => {
-      try {
-        const data = JSON.parse(ev.data);
-        const text = data.text || data.message || data.content || JSON.stringify(data);
-        addMessage('bot', text);
-      } catch {
-        addMessage('bot', ev.data);
-      }
+      let frames;
+      try { frames = JSON.parse(ev.data); } catch { return; }
+      if (!Array.isArray(frames)) frames = [frames];
+
+      frames.forEach(frame => {
+        switch (frame.kind) {
+
+          case 'opened':
+            // Step 2: open confirmed → start user session
+            setStatus('connected', 'Connected');
+            addMessage('system', '✓ Session opened — starting user session');
+            wsSend({
+              kind: 'start_session',
+              user_id: sessionUserId,
+              stt: { sample_rate: SAMPLE_RATE },
+              tts: { sample_rate: SAMPLE_RATE }
+            });
+            break;
+
+          case 'session_started':
+            addMessage('system', '✓ Ready — speak now!');
+            // Step 3: now start sending microphone audio
+            startMic();
+            break;
+
+          case 'user_text':
+            // STT recognised what the user said
+            addMessage('user', frame.text);
+            break;
+
+          case 'bot_text':
+            // Bot text reply
+            addMessage('bot', frame.text);
+            break;
+
+          case 'bot_audio':
+            // Bot audio reply — play it
+            if (frame.audio) playAudioBase64(frame.audio);
+            break;
+
+          case 'session_ended':
+            addMessage('system', '○ User session ended');
+            break;
+
+          case 'closed':
+            addMessage('system', '○ Stream closed' + (frame.reason ? ': ' + frame.reason : ''));
+            if (isActive) stopSession();
+            break;
+
+          case 'error':
+            addMessage('system', '✗ Error: ' + (frame.message || 'unknown'));
+            showToast('API error: ' + (frame.message || 'unknown'));
+            break;
+
+          default:
+            // unknown frame — ignore safely
+            break;
+        }
+      });
     };
 
     ws.onerror = () => {
       setStatus('error', 'Error');
-      showToast('WebSocket connection error');
+      showToast('WebSocket connection error — check endpoint & token');
     };
 
     ws.onclose = () => {
@@ -645,61 +746,83 @@
     };
   }
 
-  // ─── Microphone capture ───────────────────────────────────────────────────
+  // ─── Microphone capture → send Linear16 base64 audio frames ──────────────
   async function startMic() {
-    const deviceId = document.getElementById('micSelect').value;
-    const constraints = { audio: deviceId ? { deviceId: { exact: deviceId } } : true };
-    mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
-    startVisualizer(mediaStream);
-
-    mediaRecorder = new MediaRecorder(mediaStream);
-    mediaRecorder.ondataavailable = (e) => {
-      if (ws && ws.readyState === WebSocket.OPEN && e.data.size > 0) {
-        ws.send(e.data);
-      }
-    };
-    mediaRecorder.start(250); // send chunk every 250ms
-  }
-
-  function stopMic() {
-    if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
-    if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
-    stopVisualizer();
-  }
-
-  // ─── Session toggle ───────────────────────────────────────────────────────
-  async function toggleSession() {
-    if (isActive) {
-      stopSession();
-    } else {
-      await startSession();
-    }
-  }
-
-  async function startSession() {
-    const endpoint = document.getElementById('endpoint').value.trim();
-    const token    = document.getElementById('botToken').value.trim();
-
-    if (!endpoint) { showToast('Please enter a WebSocket endpoint'); return; }
-    if (!token)    { showToast('Please enter a bot token'); return; }
-
-    isActive = true;
-    setButtonActive(true);
-
     try {
-      connectWS(endpoint, token);
-      await startMic();
+      const deviceId = document.getElementById('micSelect').value;
+      const constraints = {
+        audio: {
+          sampleRate: SAMPLE_RATE,
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          ...(deviceId ? { deviceId: { exact: deviceId } } : {})
+        }
+      };
+      mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
+      startVisualizer(mediaStream);
+
+      audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+      micSource = audioCtx.createMediaStreamSource(mediaStream);
+
+      // ScriptProcessor to get raw PCM chunks
+      scriptProcessor = audioCtx.createScriptProcessor(4096, 1, 1);
+      scriptProcessor.onaudioprocess = (e) => {
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        const pcm = e.inputBuffer.getChannelData(0);
+        const b64 = float32ToBase64Linear16(pcm);
+        wsSend({ kind: 'user_audio', user_id: sessionUserId, audio: b64 });
+      };
+      micSource.connect(scriptProcessor);
+      scriptProcessor.connect(audioCtx.destination);
+
     } catch (err) {
       showToast('Microphone error: ' + err.message);
       stopSession();
     }
   }
 
+  function stopMic() {
+    if (scriptProcessor) { scriptProcessor.disconnect(); scriptProcessor = null; }
+    if (micSource) { micSource.disconnect(); micSource = null; }
+    if (audioCtx) { audioCtx.close(); audioCtx = null; }
+    if (mediaStream) { mediaStream.getTracks().forEach(t => t.stop()); mediaStream = null; }
+    stopVisualizer();
+  }
+
+  // ─── Session toggle ───────────────────────────────────────────────────────
+  async function toggleSession() {
+    isActive ? stopSession() : await startSession();
+  }
+
+  async function startSession() {
+    const host  = document.getElementById('endpoint').value.trim();
+    const token = document.getElementById('botToken').value.trim();
+    if (!host)  { showToast('Please enter a WebSocket endpoint'); return; }
+    if (!token) { showToast('Please enter a bot token'); return; }
+
+    isActive = true;
+    setButtonActive(true);
+    playbackQueue = [];
+    isPlaying = false;
+
+    connectWS(host, token);
+    // mic is started AFTER session_started frame is received from server
+  }
+
   function stopSession() {
     isActive = false;
     setButtonActive(false);
     stopMic();
-    if (ws) { ws.close(); ws = null; }
+
+    // Gracefully close v2 session & connection
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      if (sessionUserId) wsSend({ kind: 'end_session', user_id: sessionUserId });
+      wsSend({ kind: 'close' });
+      ws.close();
+    }
+    ws = null;
+    sessionUserId = null;
     setStatus('', 'Ready');
     addMessage('system', '○ Session ended');
   }
